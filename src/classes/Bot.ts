@@ -23,6 +23,7 @@ import path from 'path';
 import * as files from '../lib/files';
 import { isUsableRefreshToken } from '../lib/refreshToken';
 import { getSteamMaintenanceDelay } from '../lib/steamMaintenance';
+import handleCallback from '../lib/tools/handleCallback';
 
 import DiscordBot from './DiscordBot';
 import { Message as DiscordMessage } from 'discord.js';
@@ -65,6 +66,9 @@ type EasyCopyPasteInstance = {
 };
 
 const EasyCopyPasteCtor = EasyCopyPaste as unknown as new () => EasyCopyPasteInstance;
+
+// Temporary kill switch for the PriceDB Store / crit.tf integration.
+const PRICEDB_STORE_ENABLED = false;
 
 type PriceDBListingEvent = { id: string };
 type PriceDBInventoryRefreshedEvent = { itemCount: number; refreshCount: number };
@@ -225,8 +229,6 @@ export default class Bot {
 
     public autoRefreshListingsInterval: NodeJS.Timeout;
 
-    public lastTimeCallingDoPoll: Date;
-
     /**
      * Resets the reconnection state and clears any pending reconnection timeout
      */
@@ -337,10 +339,10 @@ export default class Bot {
             useAccessToken: !this.options.steamApiKey, // https://github.com/DoctorMcKay/node-steam-tradeoffer-manager/wiki/Access-Tokens
             language: 'en',
             pollInterval: -1,
+            minimumPollInterval: 5 * 1000, // set minimum between doPoll() calls
             cancelTime: 15 * 60 * 1000,
             pendingCancelTime: 1.5 * 60 * 1000,
-            globalAssetCache: true,
-            assetCacheMaxItems: 50
+            globalAssetCache: false
         });
 
         // ECP --START--
@@ -1124,6 +1126,8 @@ export default class Bot {
         this.addListener(this.community, 'confKeyNeeded', this.onConfKeyNeeded.bind(this), false);
 
         this.addListener(this.manager, 'pollData', this.handler.onPollData.bind(this.handler), false);
+        this.addListener(this.manager, 'pollSuccess', this.trades.onPollSuccess.bind(this.trades), false);
+        this.addListener(this.manager, 'pollFailure', this.trades.onPollFailure.bind(this.trades), false);
         this.addListener(this.manager, 'newOffer', this.trades.onNewOffer.bind(this.trades), true);
         this.addListener(this.manager, 'sentOfferChanged', this.trades.onOfferChanged.bind(this.trades), true);
         this.addListener(this.manager, 'receivedOfferChanged', this.trades.onOfferChanged.bind(this.trades), true);
@@ -1168,18 +1172,20 @@ export default class Bot {
                         });
                     },
                     (callback: Callback): void => {
-                        void (async () => {
-                            log.info('Signing in to Steam...');
-                            try {
-                                await this.login(await this.getRefreshToken());
-                                log.info('Signed in to Steam!');
-                                if (this.options.IPC) this.ipc.init();
-                                callback(null);
-                            } catch (err) {
-                                log.warn('Failed to sign in to Steam: ', err);
-                                callback(err as Error);
-                            }
-                        })();
+                        void handleCallback(
+                            (async () => {
+                                log.info('Signing in to Steam...');
+                                try {
+                                    await this.login(await this.getRefreshToken());
+                                    log.info('Signed in to Steam!');
+                                    if (this.options.IPC) this.ipc.init();
+                                } catch (err) {
+                                    log.warn('Failed to sign in to Steam: ', err);
+                                    throw err;
+                                }
+                            })(),
+                            callback
+                        );
                     },
                     (callback: Callback): void => {
                         if (!this.options.discordBotToken) {
@@ -1188,18 +1194,20 @@ export default class Bot {
                             return;
                         }
 
-                        void (async () => {
-                            log.info(`Initializing Discord bot...`);
-                            this.discordBot = new DiscordBot(this.options, this);
-                            try {
-                                await this.discordBot.start();
-                                callback(null);
-                            } catch (err) {
-                                this.discordBot = null;
-                                log.warn('Failed to start Discord bot: ', err);
-                                callback(err as Error);
-                            }
-                        })();
+                        void handleCallback(
+                            (async () => {
+                                log.info(`Initializing Discord bot...`);
+                                this.discordBot = new DiscordBot(this.options, this);
+                                try {
+                                    await this.discordBot.start();
+                                } catch (err) {
+                                    this.discordBot = null;
+                                    log.warn('Failed to start Discord bot: ', err);
+                                    throw err;
+                                }
+                            })(),
+                            callback
+                        );
                     },
                     (callback: Callback): void => {
                         log.debug('Waiting for web session');
@@ -1244,15 +1252,14 @@ export default class Bot {
                         });
                     },
                     (callback: Callback): void => {
-                        this.checkAdminBanned()
-                            .then(banned => {
+                        void handleCallback(
+                            this.checkAdminBanned().then(banned => {
                                 if (banned) {
-                                    callback(new Error('Not allowed'));
-                                    return;
+                                    throw new Error('Not allowed');
                                 }
-                                callback(null);
-                            })
-                            .catch(err => callback(err as Error));
+                            }),
+                            callback
+                        );
 
                         this.periodicCheck();
                     },
@@ -1402,11 +1409,12 @@ export default class Bot {
                                 },
                                 (cb: Callback): void => {
                                     if (
+                                        !PRICEDB_STORE_ENABLED ||
                                         !this.options.pricedbStoreApiKey ||
                                         !this.options.miscSettings.pricedbStore.enable
                                     ) {
                                         log.debug(
-                                            'Skipping PriceDB Store Manager initialization (not configured or disabled)'
+                                            'Skipping PriceDB Store Manager initialization (temporarily disabled, not configured, or disabled)'
                                         );
                                         cb(null);
                                         return;
@@ -1448,10 +1456,7 @@ export default class Bot {
                                         log.error('PriceDB Store Manager error:', err);
                                     });
 
-                                    this.pricedbStoreManager
-                                        .init()
-                                        .then(() => cb(null))
-                                        .catch(err => cb(err as Error));
+                                    void handleCallback(this.pricedbStoreManager.init(), cb);
                                 },
                                 (cb: Callback): void => {
                                     if (
@@ -1516,34 +1521,37 @@ export default class Bot {
 
                                     let rateLimitAttempts = 0;
                                     const initialiseManncoStore = (): void => {
-                                        void this.activateManncoStore()
-                                            .then(() => cb(null))
-                                            .catch(err => {
-                                                if (!(err instanceof ManncoRateLimitError)) {
-                                                    cb(err as Error);
-                                                    return;
-                                                }
-
-                                                if (rateLimitAttempts++ < 3) {
-                                                    log.warn(
-                                                        `Mannco.store login rate limited; retrying in ${Math.ceil(
-                                                            err.retryAfterMs / 1000
-                                                        )} seconds (${rateLimitAttempts}/3).`
-                                                    );
-                                                    this.manncoStoreRetryTimeout = setTimeout(() => {
-                                                        this.manncoStoreRetryTimeout = null;
-                                                        initialiseManncoStore();
-                                                    }, err.retryAfterMs);
-                                                    return;
-                                                }
-
-                                                log.warn(
-                                                    'Mannco.store remains rate limited after four login attempts; ' +
-                                                        'continuing startup and retrying initialization every 15 minutes.'
-                                                );
-                                                this.scheduleManncoStoreRetry();
+                                        void handleCallback(this.activateManncoStore(), err => {
+                                            if (!err) {
                                                 cb(null);
-                                            });
+                                                return;
+                                            }
+
+                                            if (!(err instanceof ManncoRateLimitError)) {
+                                                cb(err);
+                                                return;
+                                            }
+
+                                            if (rateLimitAttempts++ < 3) {
+                                                log.warn(
+                                                    `Mannco.store login rate limited; retrying in ${Math.ceil(
+                                                        err.retryAfterMs / 1000
+                                                    )} seconds (${rateLimitAttempts}/3).`
+                                                );
+                                                this.manncoStoreRetryTimeout = setTimeout(() => {
+                                                    this.manncoStoreRetryTimeout = null;
+                                                    initialiseManncoStore();
+                                                }, err.retryAfterMs);
+                                                return;
+                                            }
+
+                                            log.warn(
+                                                'Mannco.store remains rate limited after four login attempts; ' +
+                                                    'continuing startup and retrying initialization every 15 minutes.'
+                                            );
+                                            this.scheduleManncoStoreRetry();
+                                            cb(null);
+                                        });
                                     };
                                     initialiseManncoStore();
                                 },
@@ -1586,10 +1594,10 @@ export default class Bot {
                               }, {}) as PricesDataObject)
                             : data.pricelist || {};
 
-                        this.pricelist
-                            .setPricelist(pricelist, this)
-                            .then(() => callback(null))
-                            .catch(err => callback(err as Error));
+                        void handleCallback(
+                            this.pricelist.setPricelist(pricelist, this).then(() => undefined),
+                            callback
+                        );
                     },
                     (callback: Callback): void => {
                         log.debug('Getting max friends...');
@@ -1613,19 +1621,17 @@ export default class Bot {
                     },
                     (callback: Callback): void => {
                         log.debug('Getting localization file...');
-                        this.getLocalizationFile()
-                            .then(() => {
+                        void handleCallback(
+                            this.getLocalizationFile().then(() => {
                                 setInterval(() => {
                                     void this.getLocalizationFile();
                                 }, 24 * 60 * 60 * 1000);
-                                callback(null);
-                            })
-                            .catch(err => callback(err as Error));
+                            }),
+                            callback
+                        );
                     },
                     (callback: Callback): void => {
-                        this.setupTradeOfferUrl()
-                            .then(() => callback(null))
-                            .catch(err => callback(err as Error));
+                        void handleCallback(this.setupTradeOfferUrl(), callback);
                     }
                 ],
                 (item: (cb: Callback) => void, callback: Callback): void => {
@@ -1649,7 +1655,7 @@ export default class Bot {
                     this.manager.pollInterval = 10 * 1000;
                     this.setReady = true;
                     this.handler.onReady();
-                    this.lastTimeCallingDoPoll = dayjs().toDate();
+                    this.trades.startPollWatchdog();
                     this.manager.doPoll();
                     this.startVersionChecker();
                     this.initResetCacheInterval();

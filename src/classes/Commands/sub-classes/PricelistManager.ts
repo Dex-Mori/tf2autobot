@@ -811,8 +811,8 @@ export default class PricelistManagerCommands {
             const keyPrice = this.bot.pricelist.getKeyPrice;
             if (typeof params.buy === 'object' || typeof params.sell === 'object') {
                 if (
-                    (params.buy !== null && params.sell === undefined) ||
-                    (params.buy === undefined && params.sell !== null)
+                    (typeof params.buy === 'object' && params.sell === undefined) ||
+                    (typeof params.sell === 'object' && params.buy === undefined)
                 ) {
                     return this.bot.sendMessage(steamID, `❌ You must include both buying and selling prices.`);
                 } else if (
@@ -2094,7 +2094,9 @@ export default class PricelistManagerCommands {
         if (match === null) {
             this.bot.sendMessage(steamID, `❌ Could not find item "${priceKey}" in the pricelist`);
         } else {
-            if (steamID.redirectAnswerTo instanceof DiscordMessage && this.bot.discordBot) {
+            const commandCards = this.bot.options.discordWebhook.commandCards;
+            const useGetCard = commandCards?.enable !== false && commandCards?.get !== false;
+            if (steamID.redirectAnswerTo instanceof DiscordMessage && this.bot.discordBot && useGetCard) {
                 const stock = this.bot.inventoryManager.getInventory.getAmount({
                     priceKey: match.id ?? match.sku,
                     includeNonNormalized: false,
@@ -2112,7 +2114,7 @@ export default class PricelistManagerCommands {
                         }\n` +
                         `**PPU:** ${match.isPartialPriced ? 'Enabled' : 'Disabled'}${
                             match.group ? `\n**Group:** ${match.group}` : ''
-                        }`
+                        }\n\n### Complete entry\n\`\`\`json\n${this.generateOutput(match)}\n\`\`\``
                 );
                 return;
             }
